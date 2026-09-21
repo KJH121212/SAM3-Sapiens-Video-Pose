@@ -1,0 +1,27 @@
+# Python 캐시
+__pycache__/
+*.pyc
+
+# 가상환경 및 환경 변수
+.env
+*.env
+
+# 대용량 모델 가중치 및 체크포인트
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.tar.gz
+*.txt.gz
+
+# 데이터 디렉터리 (필요에 따라 JSON 메타만 남기거나 통째로 제외)
+data/checkpoints/
+data/00_video/
+data/01_frame/
+data/02_bboxes/
+data/03_skeleton/
+data/04_overlay/
+
+# Synology NAS 임시 파일
+@eaDir/
+*@SynoEAStream
