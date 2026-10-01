@@ -90,6 +90,12 @@ class SapiensPoseEstimator:
         device: str = "cuda:0",
         use_fp16: bool = True,
     ):
+        # 💡 [핵심 조치 1] MMEngine / PyTorch가 분산 훈련 모드로 진입하지 못하도록 강제 차단
+        for var in ["RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"]:
+            os.environ.pop(var, None)
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+
         cfg_path = Path(config_path)
         ckpt_path = Path(checkpoint_path)
 
@@ -104,31 +110,47 @@ class SapiensPoseEstimator:
         if self.device.type == "cuda":
             gpu_name = torch.cuda.get_device_name(self.device)
             vram_gb = torch.cuda.get_device_properties(self.device).total_memory / (1024**3)
-            print(f"[INFO] GPU: {gpu_name} (총 VRAM: {vram_gb:.2f} GB) | FP16={self.use_fp16}")
+            print(f"[INFO] GPU: {gpu_name} (총 VRAM: {vram_gb:.2f} GB) | FP16={self.use_fp16}", flush=True)
 
-        print(f"[INFO] Config 로드: {cfg_path.name}")
+        print(f"[INFO] Config 로드: {cfg_path.name}", flush=True)
         self.cfg = Config.fromfile(str(cfg_path))
         self.input_size = (768, 1024)  # (Width, Height)
 
-        print(f"[INFO] 모델 빌드: {ckpt_path.name}")
-        self.model = init_model(str(cfg_path), checkpoint=None, device=str(self.device))
+        print(f"[INFO] 모델 구조 생성 중...", flush=True)
+        # 💡 디바이스를 'cpu'로 먼저 빌드하거나 명시적으로 전달
+        self.model = init_model(str(cfg_path), checkpoint=None, device="cpu")
 
+        print(f"[INFO] 가중치 로드 중: {ckpt_path.name}", flush=True)
         if ckpt_path.suffix == ".safetensors":
             if not HAS_SAFETENSORS:
                 raise ImportError("pip install safetensors 가 필요합니다.")
-            state_dict = load_safetensors(str(ckpt_path), device=str(self.device))
+            
+            # 💡 [핵심 조치 2] CUDA로 직접 맵핑하지 말고 CPU 메모리로 먼저 안전하게 로드
+            state_dict = load_safetensors(str(ckpt_path), device="cpu")
             clean_dict = {
                 (k[6:] if k.startswith("model.") else k): v
                 for k, v in state_dict.items()
             }
             self.model.load_state_dict(clean_dict, strict=False)
+            del state_dict
+            del clean_dict
         else:
-            sd = torch.load(str(ckpt_path), map_location=self.device)
+            sd = torch.load(str(ckpt_path), map_location="cpu")
             if "state_dict" in sd:
                 sd = sd["state_dict"]
             self.model.load_state_dict(sd, strict=False)
+            del sd
+
+        # 💡 [핵심 조치 3] 모델을 GPU로 이동 및 FP16 변환
+        print(f"[INFO] 모델을 {self.device}로 이동 중...", flush=True)
+        self.model = self.model.to(self.device)
+
+        if self.use_fp16:
+            print(f"[INFO] FP16 캐스팅 적용 중...", flush=True)
+            self.model.half()
 
         self.model.eval()
+        print(f"[INFO] Sapiens 모델 준비 완료!", flush=True)
 
         self.codec = UDPHeatmap(
             input_size=self.input_size,
@@ -136,7 +158,6 @@ class SapiensPoseEstimator:
             sigma=6,
         )
 
-        # ImageNet 정규화 상수 캐싱
         self.mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
         self.std = np.array([58.395, 57.12, 57.375], dtype=np.float32)
 
@@ -172,29 +193,30 @@ class SapiensPoseEstimator:
         if not batch_tensors:
             return []
 
-        # 1. 배치 텐서 빌드: (B, 3, 1024, 768)
-        inp_batch = torch.from_numpy(np.stack(batch_tensors, axis=0)).to(self.device)
+        # 💡 [최적화 2] 텐서 생성 시 모델 d-type에 직접 매핑
+        dtype = torch.float16 if self.use_fp16 else torch.float32
+        inp_batch = torch.from_numpy(np.stack(batch_tensors, axis=0)).to(
+            device=self.device, dtype=dtype, non_blocking=True
+        )
 
-        # 2. 순전파 (FP16 적용)
-        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_fp16):
-            feats = self.model.backbone(inp_batch)
-            if hasattr(self.model, "neck") and self.model.neck is not None:
-                feats = self.model.neck(feats)
+        feats = self.model.backbone(inp_batch)
+        if hasattr(self.model, "neck") and self.model.neck is not None:
+            feats = self.model.neck(feats)
 
-            while isinstance(feats, (list, tuple)):
-                feats = feats[-1]
+        while isinstance(feats, (list, tuple)):
+            feats = feats[-1]
 
-            if hasattr(self.model, "head"):
-                pred_heatmaps = self.model.head(feats)
-            else:
-                pred_heatmaps = self.model.decode_head(feats)
+        if hasattr(self.model, "head"):
+            pred_heatmaps = self.model.head(feats)
+        else:
+            pred_heatmaps = self.model.decode_head(feats)
 
-            if isinstance(pred_heatmaps, tuple):
-                pred_heatmaps = pred_heatmaps[0]
+        if isinstance(pred_heatmaps, tuple):
+            pred_heatmaps = pred_heatmaps[0]
 
-        heatmaps_np = pred_heatmaps.float().detach().cpu().numpy()  # (B, 308, H/4, W/4)
+        # 디코딩을 위해 CPU 복사
+        heatmaps_np = pred_heatmaps.float().cpu().numpy()
 
-        # 3. 인스턴스별 UDP 디코딩 및 좌표 복원
         batch_results = []
         for b_idx in range(len(batch_tensors)):
             hm = heatmaps_np[b_idx]
@@ -205,7 +227,7 @@ class SapiensPoseEstimator:
                 scores = scores[0]
 
             orig_kpts = transform_points_vectorized(pred_kpts_crop, inv_trans_list[b_idx])
-            
+
             kpts_rounded = np.round(orig_kpts, 3).tolist()
             scores_rounded = np.round(scores, 3).tolist()
             batch_results.append((kpts_rounded, scores_rounded))
@@ -232,6 +254,65 @@ def flush_batch_queue(
         target_dict["keypoint_scores"] = scores
 
 
+def save_skeleton_tracked_npz(
+    output_npz_path: Path,
+    skeleton_frames_output: list,
+    total_frames: int,
+):
+    """
+    영상 내 등장하는 고유 Track ID 개수만큼 슬롯을 동적으로 할당하여
+    프레임 축(T)과 1:1로 고정된 (T, M_unique, 308, 3) Dense NPZ 포맷으로 압축 저장
+    """
+    all_unique_ids = set()
+    for f in skeleton_frames_output:
+        for inst in f.get("instances", []):
+            if inst.get("id") is not None:
+                all_unique_ids.add(int(inst["id"]))
+
+    unique_ids = sorted(list(all_unique_ids))
+    num_tracks = len(unique_ids)
+
+    if num_tracks == 0:
+        np.savez_compressed(
+            output_npz_path,
+            keypoints=np.empty((total_frames, 0, 308, 3), dtype=np.float32),
+            bboxes=np.empty((total_frames, 0, 4), dtype=np.float32),
+            track_ids=np.array([], dtype=np.int32),
+        )
+        return
+
+    id_to_slot = {track_id: slot for slot, track_id in enumerate(unique_ids)}
+
+    # 기본값 NaN으로 채워진 고정 텐서 생성
+    kpts_array = np.full((total_frames, num_tracks, 308, 3), np.nan, dtype=np.float32)
+    bbox_array = np.full((total_frames, num_tracks, 4), np.nan, dtype=np.float32)
+
+    for f in skeleton_frames_output:
+        fidx = f["frame_index"]
+        if fidx >= total_frames:
+            continue
+
+        for inst in f.get("instances", []):
+            track_id = inst.get("id")
+            if track_id is None or inst.get("keypoints") is None:
+                continue
+
+            slot = id_to_slot[int(track_id)]
+            k = np.array(inst["keypoints"], dtype=np.float32)        # (308, 2)
+            s = np.array(inst["keypoint_scores"], dtype=np.float32) # (308,)
+
+            # (308, 3) 결합: [x, y, score]
+            kpts_array[fidx, slot] = np.column_stack([k, s])
+            bbox_array[fidx, slot] = inst["bbox"]
+
+    np.savez_compressed(
+        output_npz_path,
+        keypoints=kpts_array,
+        bboxes=bbox_array,
+        track_ids=np.array(unique_ids, dtype=np.int32),
+    )
+
+
 def extract_sapiens2_skeletons(
     frame_dir: str | Path,
     bbox_json_path: str | Path,
@@ -240,7 +321,7 @@ def extract_sapiens2_skeletons(
     checkpoint_path: Optional[str | Path] = None,
     estimator: Optional[SapiensPoseEstimator] = None,
     device: str = "cuda:0",
-    batch_size: int = 4,
+    batch_size: int = 16,  # 💡 기본 배치 크기를 4에서 16으로 상향 (RTX 3090 최적화)
     use_fp16: bool = True,
 ) -> Path:
     start_time = time.time()
@@ -348,8 +429,8 @@ def extract_sapiens2_skeletons(
             instance_dict: Dict[str, Any] = {
                 "id": int(obj_id),
                 "bbox": [round(float(c), 3) for c in bbox],
-                "keypoints": None,         # 배치 추론 후 주입
-                "keypoint_scores": None,    # 배치 추론 후 주입
+                "keypoints": None,
+                "keypoint_scores": None,
             }
             if "score" in obj:
                 instance_dict["bbox_score"] = round(float(obj["score"]), 3)
@@ -380,6 +461,9 @@ def extract_sapiens2_skeletons(
         flush_batch_queue(batch_queue, estimator)
         batch_queue.clear()
 
+    # -------------------------------------------------------------
+    # 1. 기존 호환용 JSON 저장
+    # -------------------------------------------------------------
     final_output = {
         "video_name": video_name,
         "total_frames": len(skeleton_frames_output),
@@ -388,18 +472,23 @@ def extract_sapiens2_skeletons(
         "frames": skeleton_frames_output,
     }
 
-    print(f"\n[INFO] 파일 저장 중: {output_json_path} ...")
-    with open(output_json_path, "w", encoding="utf-8") as f:
-        json.dump(final_output, f, ensure_ascii=False, separators=(",", ":"))
+    # -------------------------------------------------------------
+    # 고속 시계열 분석용 Dense Tracked NPZ 단독 저장
+    # -------------------------------------------------------------
+    output_npz_path = Path(output_json_path).with_suffix(".npz")
+    print(f"\n[INFO] NPZ 저장 중: {output_npz_path} ...")
+    save_skeleton_tracked_npz(output_npz_path, skeleton_frames_output, total_frames)
+    npz_size_mb = output_npz_path.stat().st_size / (1024 * 1024)
 
-    file_size_mb = output_json_path.stat().st_size / (1024 * 1024)
     elapsed = time.time() - start_time
 
     print("\n" + "=" * 70)
-    print("✨ [SUCCESS] 배치 처리 완료")
+    print("✨ [SUCCESS] 배치 스켈레톤 추출 및 NPZ 압축 저장 완료")
     print(f"  • 총 처리 인스턴스   : {total_instances}개")
-    print(f"  • 소요 시간 / 처리속도: {elapsed:.1f}초 ({total_instances / max(elapsed, 0.001):.1f} instances/sec)")
-    print(f"  • 파일 크기          : {file_size_mb:.2f} MB")
+    print(
+        f"  • 소요 시간 / 처리속도: {elapsed:.1f}초 ({total_instances / max(elapsed, 0.001):.1f} instances/sec)"
+    )
+    print(f"  • 최종 NPZ 크기      : {npz_size_mb:.2f} MB")
     print("=" * 70 + "\n")
 
-    return output_json_path
+    return output_npz_path

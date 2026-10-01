@@ -1,8 +1,7 @@
-import json
 import os
 from pathlib import Path
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 from tqdm import tqdm
@@ -42,7 +41,7 @@ GOLIATH_BODY_LINKS = [
     (4, 6),    # right_ear - right_shoulder
 ]
 
-# 인스턴스 ID별 구분을 위한 고대비 BGR 색상 팔레트
+# 인스턴스 ID별 구분을 위한 고대비 BGR 색상 팔레트 (SAM 마스크 및 BBox 라벨용)
 DISTINCT_COLORS = [
     (0, 255, 255),    # 노랑
     (0, 255, 128),    # 연두
@@ -58,7 +57,9 @@ DISTINCT_COLORS = [
 
 
 def get_instance_color(instance_id: int) -> Tuple[int, int, int]:
-    """ID에 따라 고정된 고유 BGR 색상 반환"""
+    """ID에 따라 고유 BGR 색상 반환"""
+    if instance_id <= 0:
+        return (200, 200, 200)
     return DISTINCT_COLORS[(abs(int(instance_id)) - 1) % len(DISTINCT_COLORS)]
 
 
@@ -69,89 +70,83 @@ def draw_label(
     bg_color: Tuple[int, int, int],
     text_color: Tuple[int, int, int] = (255, 255, 255),
 ):
-    """가독성을 위해 배경 사각형이 포함된 텍스트 라벨 출력"""
+    """가독성을 위해 배경 사각형 및 외곽 테두리가 포함된 라벨 출력"""
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.6
     thickness = 2
     (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
     x, y = pos
-    y = max(y, th + 6)
+    y = max(y, th + 8)
 
     # 텍스트 배경 박스
     cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y + baseline - 2), bg_color, -1)
-    # 텍스트 렌더링
+    cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y + baseline - 2), (0, 0, 0), 1, cv2.LINE_AA)
+
+    # 텍스트 그림자 + 글씨
+    cv2.putText(img, text, (x + 4, y - 3), font, scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
     cv2.putText(img, text, (x + 3, y - 4), font, scale, text_color, thickness, cv2.LINE_AA)
 
 
 def overlay_skeleton_to_video(
     frame_dir: str | Path,
-    skeleton_json_path: str | Path,
+    skeleton_npz_path: str | Path,
     output_video_path: str | Path,
+    sam_npz_path: Optional[str | Path] = None,
     fps: float = 30.0,
     score_thresh: float = 0.35,
     draw_bones: bool = True,
     draw_dense_points: bool = True,
 ) -> Path:
-    """프레임 이미지와 Sapiens 308 스켈레톤 JSON을 읽어 BBox + ID + Skeleton 합성 비디오 생성"""
+    """프레임 이미지, Sapiens 스켈레톤 NPZ, SAM 마스크 NPZ를 합성하여 비디오 생성"""
     start_time = time.time()
     frame_dir = Path(frame_dir)
-    skt_json_path = Path(skeleton_json_path)
+    skt_npz_path = Path(skeleton_npz_path)
     out_vid_path = Path(output_video_path)
 
     print("\n" + "=" * 70)
-    print("[INFO] 스켈레톤 오버레이 비디오 렌더링 시작")
+    print("[INFO] SAM 마스크 + 스켈레톤 복합 오버레이 비디오 렌더링 시작")
     print("=" * 70)
 
     # -------------------------------------------------------------
-    # 💡 1. 파일 검증 및 사전 체크 디버깅
+    # 1. 파일 검증
     # -------------------------------------------------------------
-    if not skt_json_path.exists():
-        raise FileNotFoundError(f"[ERROR] 스켈레톤 JSON 파일이 없습니다: {skt_json_path.resolve()}")
-    if not skt_json_path.is_file():
-        raise ValueError(f"[ERROR] 지정한 스켈레톤 경로가 파일이 아닙니다: {skt_json_path.resolve()}")
-
-    if not frame_dir.exists():
-        raise FileNotFoundError(f"[ERROR] 프레임 디렉터리가 존재하지 않습니다: {frame_dir.resolve()}")
+    if not skt_npz_path.exists():
+        raise FileNotFoundError(f"[ERROR] 스켈레톤 NPZ 파일이 없습니다: {skt_npz_path.resolve()}")
     if not frame_dir.is_dir():
         raise NotADirectoryError(f"[ERROR] 프레임 경로가 폴더가 아닙니다: {frame_dir.resolve()}")
 
     out_vid_path.parent.mkdir(parents=True, exist_ok=True)
 
     # -------------------------------------------------------------
-    # 💡 2. JSON 로드 및 인덱싱 매핑
+    # 2. NPZ 데이터 로드 (스켈레톤 및 SAM 마스크)
     # -------------------------------------------------------------
-    print(f"[INFO] 스켈레톤 데이터 파싱 중: {skt_json_path.name}")
-    try:
-        with open(skt_json_path, "r", encoding="utf-8") as f:
-            skt_meta = json.load(f)
-    except Exception as e:
-        raise ValueError(f"[ERROR] 스켈레톤 JSON을 파싱할 수 없습니다: {e}")
+    print(f"[INFO] 스켈레톤 NPZ 로드: {skt_npz_path.name}")
+    data = np.load(skt_npz_path)
+    kpts_all = data["keypoints"]  # (T, M, 308, 3) -> [x, y, score]
+    track_ids = data["track_ids"]  # (M,)
+    total_npz_frames, num_slots, num_kpts, _ = kpts_all.shape
 
-    raw_frames = skt_meta.get("frames", [])
-    if not raw_frames:
-        raise ValueError("[ERROR] 스켈레톤 JSON 내 'frames' 목록이 비어 있습니다.")
+    # SAM 마스크 로드 (지정되지 않았거나 존재하지 않을 경우 자동 탐색 fallback)
+    sam_masks_3d = None
+    if sam_npz_path is None:
+        # data_new/03_KPT308/path.npz -> data_new/02_SAM/path_masks.npz 유추
+        guess_sam_path = skt_npz_path.parent.parent / "02_SAM" / f"{skt_npz_path.stem}_masks.npz"
+        if guess_sam_path.exists():
+            sam_npz_path = guess_sam_path
 
-    num_keypoints = skt_meta.get("num_keypoints", 308)
-    print(f"[INFO] 키포인트 포맷: {skt_meta.get('keypoint_format', 'UNKNOWN')} ({num_keypoints} pts)")
-
-    skt_by_frame_idx: Dict[int, List[Dict]] = {}
-    skt_by_filename: Dict[str, List[Dict]] = {}
-    for f_entry in raw_frames:
-        fidx = f_entry.get("frame_index")
-        fname = f_entry.get("file_name")
-        insts = f_entry.get("instances", [])
-        if fidx is not None:
-            skt_by_frame_idx[int(fidx)] = insts
-        if fname is not None:
-            skt_by_filename[fname] = insts
+    if sam_npz_path and Path(sam_npz_path).exists():
+        print(f"[INFO] SAM 마스크 NPZ 로드: {Path(sam_npz_path).name}")
+        with np.load(sam_npz_path) as sdata:
+            sam_masks_3d = sdata["masks"]  # (T, H, W)
+    else:
+        print("[WARN] SAM 마스크 파일이 지정되지 않았거나 없습니다. 마스크 렌더링을 생략합니다.")
 
     # -------------------------------------------------------------
-    # 💡 3. 프레임 이미지 목록 정렬
+    # 3. 프레임 이미지 목록 정렬
     # -------------------------------------------------------------
+    valid_exts = {".jpg", ".jpeg", ".png", ".bmp"}
     all_frame_paths = sorted(
-        [p for p in frame_dir.rglob("*.jpg")]
-        + [p for p in frame_dir.rglob("*.png")]
-        + [p for p in frame_dir.rglob("*.jpeg")]
+        [p for p in frame_dir.rglob("*") if p.suffix.lower() in valid_exts]
     )
     try:
         all_frame_paths.sort(key=lambda p: int(p.stem))
@@ -169,68 +164,75 @@ def overlay_skeleton_to_video(
     print(f"[INFO] 비디오 규격: {width}x{height} @ {fps}fps (총 {total_frames} 프레임)")
 
     # -------------------------------------------------------------
-    # 💡 4. VideoWriter 초기화
+    # 4. VideoWriter 초기화
     # -------------------------------------------------------------
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_vid_path), fourcc, fps, (width, height))
     if not writer.isOpened():
-        raise IOError(f"[ERROR] 비디오 라이터 생성 실패. 코덱 및 경로를 확인하세요: {out_vid_path}")
+        raise IOError(f"[ERROR] 비디오 라이터 생성 실패: {out_vid_path}")
 
     # -------------------------------------------------------------
-    # 💡 5. 프레임별 오버레이 렌더링 루프
+    # 5. 프레임별 오버레이 렌더링 루프
     # -------------------------------------------------------------
-    rendered_instances = 0
+    render_len = min(total_frames, total_npz_frames)
+    if sam_masks_3d is not None:
+        render_len = min(render_len, len(sam_masks_3d))
 
-    for fidx, img_path in enumerate(tqdm(all_frame_paths, desc="Overlay Rendering")):
-        frame = cv2.imread(str(img_path))
+    for fidx in tqdm(range(render_len), desc="Overlay Rendering"):
+        frame = cv2.imread(str(all_frame_paths[fidx]))
         if frame is None:
             continue
 
-        instances = skt_by_filename.get(img_path.name, skt_by_frame_idx.get(fidx, []))
+        if frame.shape[:2] != (height, width):
+            frame = cv2.resize(frame, (width, height))
 
-        for inst in instances:
-            obj_id = inst.get("id", -1)
-            bbox = inst.get("bbox")
-            keypoints = inst.get("keypoints")
-            scores = inst.get("keypoint_scores")
+        # [1] SAM 마스크 반투명 오버레이 및 SAM 기반 BBox/라벨 렌더링
+        if sam_masks_3d is not None:
+            frame_mask = sam_masks_3d[fidx]
+            unique_uids = [int(u) for u in np.unique(frame_mask) if u > 0]
 
-            color = get_instance_color(obj_id)
+            if len(unique_uids) > 0:
+                # 1-1. 마스크 반투명 합성
+                overlay = frame.copy()
+                for uid in unique_uids:
+                    color = get_instance_color(uid)
+                    overlay[frame_mask == uid] = color
+                cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
 
-            # [1] BBox & ID 라벨 그리기
-            if bbox and len(bbox) == 4:
-                x1, y1, x2, y2 = [int(round(c)) for c in bbox]
-                # BBox 경계선
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-                # 라벨 텍스트
-                label_txt = f"ID: {obj_id}"
-                if "bbox_score" in inst and inst["bbox_score"] is not None:
-                    label_txt += f" ({inst['bbox_score']:.2f})"
-                draw_label(frame, label_txt, (x1, y1), bg_color=color)
+                # 1-2. SAM 마스크 픽셀에서 BBox 도출 및 ID 표시
+                for uid in unique_uids:
+                    y_indices, x_indices = np.where(frame_mask == uid)
+                    if len(y_indices) > 50:  # 노이즈 방지
+                        bx1, bx2 = int(np.min(x_indices)), int(np.max(x_indices))
+                        by1, by2 = int(np.min(y_indices)), int(np.max(y_indices))
+                        id_color = get_instance_color(uid)
 
-            if not keypoints:
+                        # BBox 사각형 (외곽 검은선 + 내부 ID 색상)
+                        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 0), 3, cv2.LINE_AA)
+                        cv2.rectangle(frame, (bx1, by1), (bx2, by2), id_color, 2, cv2.LINE_AA)
+
+                        # ID 라벨
+                        draw_label(frame, f"ID: {uid}", (bx1, by1), bg_color=id_color)
+
+        # [2] Sapiens 스켈레톤 렌더링 (모든 인물 동일하게 '검은색 외곽선 + 흰색 실선' 적용)
+        for slot in range(num_slots):
+            kpts_with_score = kpts_all[fidx, slot]
+
+            if np.isnan(kpts_with_score).any():
                 continue
 
-            rendered_instances += 1
-            kpts_arr = np.array(keypoints, dtype=np.float32)
-            scores_arr = (
-                np.array(scores, dtype=np.float32)
-                if scores is not None
-                else np.ones(len(kpts_arr), dtype=np.float32)
-            )
+            pts = kpts_with_score[:, :2]
+            scores = kpts_with_score[:, 2]
 
-            # [2] 주요 뼈대 연결선 (Bones) 그리기
+            # 2-1. 뼈대 연결선 (Bones) - 검은색(두께 4) + 흰색(두께 2) 이중선
             if draw_bones:
                 for idx1, idx2 in GOLIATH_BODY_LINKS:
-                    if idx1 >= len(kpts_arr) or idx2 >= len(kpts_arr):
+                    if idx1 >= num_kpts or idx2 >= num_kpts:
                         continue
-                    sc1, sc2 = scores_arr[idx1], scores_arr[idx2]
-                    if sc1 < score_thresh or sc2 < score_thresh:
+                    if scores[idx1] < score_thresh or scores[idx2] < score_thresh:
                         continue
 
-                    pt1 = kpts_arr[idx1]
-                    pt2 = kpts_arr[idx2]
-
-                    # 💡 비정상 발산 좌표(Out-of-bounds) 필터링
+                    pt1, pt2 = pts[idx1], pts[idx2]
                     if (
                         pt1[0] < -50 or pt1[0] > width + 50 or pt1[1] < -50 or pt1[1] > height + 50
                         or pt2[0] < -50 or pt2[0] > width + 50 or pt2[1] < -50 or pt2[1] > height + 50
@@ -239,28 +241,31 @@ def overlay_skeleton_to_video(
 
                     p1 = (int(round(pt1[0])), int(round(pt1[1])))
                     p2 = (int(round(pt2[0])), int(round(pt2[1])))
-                    cv2.line(frame, p1, p2, color, 2, cv2.LINE_AA)
 
-            # [3] 308개 키포인트 점(Circles) 그리기
-            for kidx, (pt, score) in enumerate(zip(kpts_arr, scores_arr)):
+                    # 1단계: 검은색 굵은 외곽선
+                    cv2.line(frame, p1, p2, (0, 0, 0), 4, cv2.LINE_AA)
+                    # 2단계: 흰색 내부 중심선
+                    cv2.line(frame, p1, p2, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # 2-2. 관절 포인트 그리기
+            for kidx, (pt, score) in enumerate(zip(pts, scores)):
                 if score < score_thresh:
                     continue
 
                 x, y = pt[0], pt[1]
-                # 화면 범위 이탈 필터링
                 if x < 0 or x >= width or y < 0 or y >= height:
                     continue
 
                 center = (int(round(x)), int(round(y)))
-
-                # 주요 관절(0~20, 41, 62번)은 크고 굵게, 얼굴/손가락 등 밀집 포인트는 미세하게 표시
                 is_major_joint = (kidx <= 20) or (kidx in [41, 62])
+
                 if is_major_joint:
-                    cv2.circle(frame, center, 4, color, -1, cv2.LINE_AA)
-                    cv2.circle(frame, center, 5, (255, 255, 255), 1, cv2.LINE_AA)
+                    # 주요 관절: 검은 테두리(반경 5) + 내부 흰색 원(반경 3)
+                    cv2.circle(frame, center, 5, (0, 0, 0), -1, cv2.LINE_AA)
+                    cv2.circle(frame, center, 3, (255, 255, 255), -1, cv2.LINE_AA)
                 elif draw_dense_points:
-                    # 손가락/얼굴 세부 점 (반경 2)
-                    cv2.circle(frame, center, 2, color, -1, cv2.LINE_AA)
+                    # 세부 관절: 시각 간섭을 줄이기 위한 작은 회색 점(반경 2)
+                    cv2.circle(frame, center, 2, (160, 160, 160), -1, cv2.LINE_AA)
 
         writer.write(frame)
 
@@ -269,12 +274,11 @@ def overlay_skeleton_to_video(
     file_size_mb = out_vid_path.stat().st_size / (1024 * 1024)
 
     print("\n" + "=" * 70)
-    print("✨ [SUCCESS] 스켈레톤 오버레이 비디오 저장 완료")
+    print("✨ [SUCCESS] SAM 마스크 & 스켈레톤 오버레이 비디오 저장 완료")
     print(f"  • 출력 비디오 파일 : {out_vid_path.resolve()}")
     print(f"  • 비디오 파일 크기 : {file_size_mb:.2f} MB")
-    print(f"  • 렌더링 프레임    : {total_frames} 장")
-    print(f"  • 누적 인스턴스    : {rendered_instances} 개")
-    print(f"  • 처리 속도        : {total_frames / max(elapsed, 0.001):.1f} fps (소요시간: {elapsed:.1f}초)")
+    print(f"  • 렌더링 프레임    : {render_len} 장")
+    print(f"  • 처리 속도        : {render_len / max(elapsed, 0.001):.1f} fps (소요시간: {elapsed:.1f}초)")
     print("=" * 70 + "\n")
 
     return out_vid_path

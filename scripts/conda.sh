@@ -39,6 +39,7 @@ pip install \
     "matplotlib<3.9.0" \
     "contourpy<1.3.0" \
     safetensors \
+    pandas \
     timm \
     einops \
     huggingface_hub \
@@ -53,7 +54,8 @@ pip install \
     rich \
     portalocker \
     ftfy \
-    prettytable
+    prettytable \
+    ultralytics
 
 echo "=== [4.5/5] OpenMMLab (mmengine, mmcv-lite, mmpose) 설치 ==="
 pip install mmengine

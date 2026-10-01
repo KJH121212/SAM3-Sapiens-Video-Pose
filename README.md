@@ -36,8 +36,9 @@
          ▼
 [SAM 3 메모리 뱅크 기반 정방향/역방향 양방향 트래킹 (run_bidirectional_tracking)]
          │
-         ▼
-[02_bboxes: 프레임별 인물 ID & BBox JSON 저장]
+         ├─────────────────────────────────────────┐
+         ▼                                         ▼
+[02_bboxes: ID & BBox JSON 저장]        [02_bboxes: (T, H, W) Label Map NPZ 저장]
          │
          ▼
 [Sapiens 2 배치 추론 (extract_sapiens2_skeletons, Batch Size=4~8, FP16)]
@@ -81,7 +82,9 @@
     │   └── sapiens2/                # Sapiens 2 체크포인트 (.safetensors)
     ├── 00_video/                    # 원본 입력 비디오 파일
     ├── 01_frame/                    # 추출된 프레임 이미지 디렉터리
-    ├── 02_bboxes/                   # SAM 3 트래킹 결과 BBox JSON
+    ├── 02_bboxes/                   # SAM 3 트래킹 결과
+    │   ├── <video_name>.json        # 프레임별 인물 ID, BBox, 해상도 메타데이터
+    │   └── <video_name>_masks.npz   # 프레임별 ID 라벨 맵 3D 압축 마스크 (T, H, W)
     ├── 03_skeleton/                 # Sapiens 2 308 키포인트 JSON
     └── 04_overlay/                  # 최종 합성된 검증용 오버레이 영상
 
@@ -183,3 +186,46 @@ python scripts/total_pipeline.py
 }
 
 ```
+
+## 🎭 마스크 데이터 포맷 (`data/02_bboxes/*_masks.npz`)
+
+대규모 비디오 처리 시 I/O 병목 및 디스크 용량을 최적화하기 위해, SAM 3 인스턴스 분할 마스크는 **ID 맵(Label Map) 형태의 3D 압축 넘파이 아카이브(`.npz`)**로 저장됩니다.
+
+### 1. 포맷 특징
+* **Shape**: `(T, H, W)` (3D `numpy.ndarray`, 정수형 `uint8`)
+  * `T`: 전체 비디오 프레임 수
+  * `H, W`: 원본 비디오 해상도 (세로, 가로)
+* **Pixel Encoding**: 픽셀 값 자체가 인물의 고유 식별자(ID)입니다.
+  * `0`: 배경 (Background)
+  * `1`: 타깃 1번 인물 (예: 영아)
+  * `2, 3...`: 타깃 2번, 3번 인물 (예: 검사자, 보호자 등)
+* **Metadata**: 원본 해상도 `[W, H]`가 `resolution` 키로 내장되어 있습니다.
+
+---
+
+### 2. 마스크 로드 및 활용 예제 (Python)
+
+```python
+import numpy as np
+
+# 1. NPZ 마스크 파일 로드
+mask_path = "data/02_bboxes/p01_gross_motor_4_masks.npz"
+data = np.load(mask_path)
+
+masks = data["masks"]              # Shape: (T, H, W), dtype: uint8
+orig_w, orig_h = data["resolution"] # [가로, 세로]
+
+print(f"총 프레임: {masks.shape[0]}, 해상도: {orig_w}x{orig_h}")
+
+# 2. 특정 프레임(t)에서 특정 인물(ID=1)의 바이너리 마스크 추출
+t = 120
+target_id = 1
+baby_mask = (masks[t] == target_id)  # (H, W) boolean 배열 (True/False)
+
+# 3. 키포인트 (px, py)가 아기 마스크 내부에 있는지 즉시 검증 (In-Mask Check)
+px, py = 450, 320
+is_in_mask = (masks[t, py, px] == target_id)  # True/False
+
+# 4. 검사자(ID=2)와의 신체 겹침/가림(Occlusion) 영역 계산
+doctor_mask = (masks[t] == 2)
+overlap_area = baby_mask & doctor_mask  # 인물 간 겹침 픽셀

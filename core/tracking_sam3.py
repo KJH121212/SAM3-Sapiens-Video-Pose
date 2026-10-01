@@ -53,7 +53,6 @@ def mask_to_rle(mask):
 
 def mask_to_bbox(mask):
     """이진 마스크로부터 Bounding Box 추출.
-
     Returns: [x_min, y_min, x_max, y_max]
     """
     rows = np.any(mask, axis=1)
@@ -102,9 +101,6 @@ def add_text_prompt(datapoint, text_query):
 # ==============================================================================
 # [Part 1] 객체 검출
 # ==============================================================================
-# ==============================================================================
-# [Part 1] 객체 검출
-# ==============================================================================
 def detect_objects(
     frame_dir: str,
     text_prompt: str,
@@ -130,15 +126,11 @@ def detect_objects(
 
     img_path = candidates[target_frame_idx]
 
-    # [디버그 1] 실제 읽어들이는 이미지 검증
     pil_img = Image.open(img_path).convert("RGB")
     print(f"\n========== [DEBUG LOG START] ==========")
     print(f"1. 검출 대상 이미지 파일: {img_path}")
-    print(
-        f"   - 이미지 크기: {pil_img.size} (W, H), 포맷: {pil_img.format}, 모드: {pil_img.mode}"
-    )
+    print(f"   - 이미지 크기: {pil_img.size} (W, H), 포맷: {pil_img.format}, 모드: {pil_img.mode}")
 
-    # 텍스트 프롬프트 뒤에 온점(.)이 없으면 붙여서 시도
     clean_prompt = text_prompt.strip()
     if not clean_prompt.endswith("."):
         clean_prompt += "."
@@ -174,7 +166,6 @@ def detect_objects(
         ]
     )
 
-    # [디버그 2] 임계값을 극단적으로 낮춤 (0.05)
     postprocessor = PostProcessImage(
         max_dets_per_img=-1,
         iou_type="segm",
@@ -188,7 +179,6 @@ def detect_objects(
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         datapoint = create_empty_datapoint()
         set_image(datapoint, pil_img)
-        # 프롬프트는 'person' (마침표 없이)
         add_text_prompt(datapoint, "person")
         datapoint = transform(datapoint)
 
@@ -197,7 +187,6 @@ def detect_objects(
 
         raw_outputs = model(batch)
 
-        # [디버그] raw_outputs 내부 확인
         print(f"4. raw_outputs 타입: {type(raw_outputs)}")
         if hasattr(raw_outputs, "loss_stages"):
             find_stages = raw_outputs
@@ -210,7 +199,6 @@ def detect_objects(
         else:
             find_stages = raw_outputs
 
-        # 후처리 실행
         processed_results = postprocessor.process_results(
             find_stages, batch.find_metadatas
         )
@@ -234,24 +222,9 @@ def detect_objects(
     print(f"========== [DEBUG LOG END] ==========\n")
     return None
 
-    del batch
-
-    print(f"5. Processed Results 개수: {len(processed_results)}")
-    if len(processed_results) > 0:
-        result = list(processed_results.values())[0]
-        scores = result.get("scores", torch.tensor([]))
-        boxes = result.get("boxes", torch.tensor([]))
-        print(f"   - 통과된 BBox 개수: {len(boxes)}")
-        print(f"   - 검출 스코어(Top 5): {scores[:5].tolist()}")
-        print(f"========== [DEBUG LOG END] ==========\n")
-        return result
-
-    print(f"   - 0.05 임계값 기준 통과 객체 없음.")
-    print(f"========== [DEBUG LOG END] ==========\n")
-    return None
 
 # ==============================================================================
-# [Part 2] 양방향 트래킹 및 단일 JSON 저장
+# [Part 2] 양방향 트래킹 및 단일 JSON + NPZ 저장
 # ==============================================================================
 class LazyVideoLoader:
 
@@ -316,34 +289,50 @@ def init_state_lazy(predictor, video_path):
 
 
 def collect_frame_data(
-    frame_idx, obj_ids, video_res_masks, state, total_results: Dict[int, Any]
+    frame_idx,
+    obj_ids,
+    video_res_masks,
+    state,
+    total_results: Dict[int, Any],
+    label_masks_dict: Dict[int, np.ndarray],
+    H: int,
+    W: int,
 ):
-    """메모리 딕셔너리에 프레임별 BBox 및 객체 정보 누적"""
+    """메모리 딕셔너리에 프레임별 BBox 및 객체 정보 누적, 방식 A Label Map 생성"""
     frame_entry = {
         "frame_index": int(frame_idx),
         "file_name": os.path.basename(state["images"].frame_paths[frame_idx]),
         "objects": [],
     }
 
+    # 해당 프레임의 빈 라벨 맵 (0: 배경, uint8)
+    frame_canvas = np.zeros((H, W), dtype=np.uint8)
+
     if video_res_masks is not None and len(video_res_masks) > 0:
         for k, obj_id in enumerate(obj_ids):
             if isinstance(obj_id, torch.Tensor):
                 obj_id = obj_id.item()
+            obj_id = int(obj_id)
+
             mask_tensor = video_res_masks[k]
             if mask_tensor.dim() == 3:
                 mask_tensor = mask_tensor.squeeze(0)
-            mask_np = (mask_tensor.cpu().numpy() > 0.0).astype(np.uint8)
+            
+            mask_np = (mask_tensor.cpu().numpy() > 0.0)
 
             if np.any(mask_np):
                 bbox = mask_to_bbox(mask_np)
                 obj_info = {
-                    "id": int(obj_id),
+                    "id": obj_id,
                     "bbox": bbox,  # [x_min, y_min, x_max, y_max]
-                    # "segmentation": mask_to_rle(mask_np)  # 필요 시 주석 해제
                 }
                 frame_entry["objects"].append(obj_info)
+                
+                # 💡 [방식 A] 해당 인물 영역에 고유 ID 정수 번호 부여
+                frame_canvas[mask_np] = obj_id
 
     total_results[int(frame_idx)] = frame_entry
+    label_masks_dict[int(frame_idx)] = frame_canvas
 
 
 def run_bidirectional_tracking(
@@ -352,14 +341,19 @@ def run_bidirectional_tracking(
     output_dir: str,
     start_frame_idx: int,
     model=None,
-    checkpoint_path: str = None,  # 💡 추가
-    bpe_path: str = None,  # 💡 추가
+    checkpoint_path: str = None,
+    bpe_path: str = None,
 ) -> Path:
     frame_dir_path = Path(frame_dir)
     out_dir_path = Path(output_dir)
-    out_dir_path.mkdir(parents=True, exist_ok=True)
 
-    json_file_path = out_dir_path / f"{frame_dir_path.name}.json"
+    # 💡 [수정] output_dir 바로 아래에 2개의 파일 생성
+    # 예: /workspace/data_new/02_SAM/video_name.json
+    #    /workspace/data_new/02_SAM/video_name_masks.npz
+    video_stem = frame_dir_path.name
+    json_file_path = f"{out_dir_path}.json"
+    npz_file_path = f"{out_dir_path}_masks.npz"
+
     mask_key = "masks" if "masks" in detection_results else "segmentation"
     num_objs = detection_results["scores"].numel()
 
@@ -376,7 +370,6 @@ def run_bidirectional_tracking(
             else "/workspace/data/checkpoints/SAM3/bpe_simple_vocab_16e6.txt.gz"
         )
 
-        # 💡 checkpoint_path와 bpe_path를 명시적으로 전달
         sam3_model = build_sam3_video_model(
             checkpoint_path=ckpt_path,
             bpe_path=vocab_path,
@@ -390,6 +383,8 @@ def run_bidirectional_tracking(
     predictor.backbone = sam3_model.detector.backbone
 
     state = init_state_lazy(predictor, frame_dir)
+    vid_h = int(state["video_height"])
+    vid_w = int(state["video_width"])
 
     # 1. 초기 마스크 등록
     for i in range(num_objs):
@@ -405,6 +400,7 @@ def run_bidirectional_tracking(
 
     # 전체 결과를 수집할 딕셔너리
     total_results = {}
+    label_masks_dict = {}
 
     # 2. 정방향 추적 (start_frame_idx -> End)
     for (
@@ -421,7 +417,14 @@ def run_bidirectional_tracking(
         propagate_preflight=True,
     ):
         collect_frame_data(
-            frame_idx, obj_ids, video_res_masks, state, total_results
+            frame_idx,
+            obj_ids,
+            video_res_masks,
+            state,
+            total_results,
+            label_masks_dict,
+            vid_h,
+            vid_w,
         )
 
         # VRAM 메모리 정리
@@ -461,7 +464,14 @@ def run_bidirectional_tracking(
         propagate_preflight=True,
     ):
         collect_frame_data(
-            frame_idx, obj_ids, video_res_masks, state, total_results
+            frame_idx,
+            obj_ids,
+            video_res_masks,
+            state,
+            total_results,
+            label_masks_dict,
+            vid_h,
+            vid_w,
         )
 
         if frame_idx < start_frame_idx and frame_idx % 100 == 0:
@@ -485,14 +495,21 @@ def run_bidirectional_tracking(
                     for k in keys_to_remove_obj:
                         del outputs_obj[k]
 
+    # 💡 트래커 내부 상태 정리 및 메모리 누수 방지
+    try:
+        predictor.clear_all_points_in_video(state)
+    except Exception:
+        pass
     del state
 
-    # 4. 프레임 번호 기준 오름차순 정렬 후 단일 파일로 덤프
-    sorted_frames = [
-        total_results[idx] for idx in sorted(total_results.keys())
-    ]
+    # 4. 프레임 번호 기준 정렬 후 단일 BBox JSON 파일로 덤프
+    sorted_frame_indices = sorted(total_results.keys())
+    sorted_frames = [total_results[idx] for idx in sorted_frame_indices]
+    
     final_output = {
-        "video_name": frame_dir_path.name,
+        "video_name": video_stem,
+        "image_width": vid_w,
+        "image_height": vid_h,
         "total_frames": len(sorted_frames),
         "frames": sorted_frames,
     }
@@ -500,5 +517,19 @@ def run_bidirectional_tracking(
     with open(json_file_path, "w", encoding="utf-8") as f:
         json.dump(final_output, f, indent=2)
 
-    print(f"✅ 통합 BBox JSON 저장 완료: {json_file_path}")
+    # 5. 전체 프레임 라벨 마스크를 (T, H, W) 3D uint8 배열로 변환 후 압축 저장
+    T = len(sorted_frame_indices)
+    mask_3d = np.zeros((T, vid_h, vid_w), dtype=np.uint8)
+    for i, f_idx in enumerate(sorted_frame_indices):
+        if f_idx in label_masks_dict:
+            mask_3d[i] = label_masks_dict[f_idx]
+
+    np.savez_compressed(
+        npz_file_path,
+        masks=mask_3d,
+        resolution=np.array([vid_w, vid_h], dtype=np.int32),
+    )
+
+    print(f"✅ 통합 BBox JSON 저장 완료: {json_file_path} (Resolution: {vid_w}x{vid_h})")
+    print(f"✅ 압축 Label Mask NPZ 저장 완료: {npz_file_path} (Shape: {mask_3d.shape}, dtype: uint8)")
     return json_file_path
